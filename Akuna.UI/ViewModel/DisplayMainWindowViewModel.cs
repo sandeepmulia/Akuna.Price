@@ -15,6 +15,7 @@ using System.Collections.Specialized;
 using System.Threading;
 using System.Diagnostics;
 using System.Collections;
+using System.Collections.Concurrent;
 
 namespace Akuna.UI.ViewModel
 {
@@ -42,6 +43,12 @@ namespace Akuna.UI.ViewModel
 
         private List<DeltaIndicator> _deltaIndicator = new List<Model.DeltaIndicator>();
         public List<DeltaIndicator> DeltaIndicator { get; set; }
+        private BlockingCollection<Instrument> _queue = new BlockingCollection<Instrument>();
+        private Task _consumer;
+        private Task _producer;
+        private CancellationTokenSource _token;
+        private System.Timers.Timer _timer = new System.Timers.Timer();
+        private volatile bool _resetFlag = true;
 
         public DisplayMainWindowViewModel()
         {
@@ -50,14 +57,71 @@ namespace Akuna.UI.ViewModel
             StartCommand = new DelegateCommand(StartPriceService, EnableStartButton);
             StopCommand = new DelegateCommand(StopPriceService, EnableStopButton);
             priceService = new RandomWalkPriceService();
-            priceService.NewPricesArrived += PriceUpdateHandler;
+            StartConsumer();
+            StartTimer();
+        }
+
+        private void StartTimer()
+        {
+            _timer.Elapsed += _timer_Elapsed;
+            _timer.Interval = 5000;
+            _timer.Enabled = true; //Enables timer !!
+            _timer.AutoReset = true; //Re-raise event after interval elapses. This will ensure it loops
+        }
+
+        private void _timer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            lock (_syncLock)
+            {
+                _resetFlag = !_resetFlag;
+            }
+        }
+
+        private void StartConsumer()
+        {
+            _token = new CancellationTokenSource();
+
+            _consumer = Task.Factory.StartNew(() =>
+            {
+                while (!_queue.IsCompleted)
+                {
+                    if (_token.IsCancellationRequested)
+                        break;
+
+                    Instrument item;
+                    _queue.TryTake(out item);
+
+                    if (item != null)
+                    {
+                        _instrumentsCache.AddOrUpdate(item.InstrumentId, new Instrument()
+                        {
+                            InstrumentId = item.InstrumentId,
+                            AskPx = item.AskPx,
+                            AskQty = item.AskQty,
+                            BidPx = item.BidPx,
+                            BidQty = item.BidQty,
+                            Volume = item.Volume
+                        });
+
+                        var found = _deltaIndicator.Find(inst => inst.instrumentId == item.InstrumentId);
+                        if (found != null)
+                        {
+                            found.CurrentPrice = item.AskPx;
+                        }
+                        else
+                        {
+                            _deltaIndicator.Add(new Model.DeltaIndicator(item.InstrumentId, item.AskPx, item.AskPx));
+                        }
+                    }
+                }
+            }, _token.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         private void PriceUpdateHandler(IPriceService sender, uint instrumentID, IPrices prices)
         {
-            lock (_syncLock)
+            if (_resetFlag)
             {
-                _instrumentsCache.AddOrUpdate(instrumentID, new Instrument()
+                _queue.Add(new Instrument()
                 {
                     InstrumentId = instrumentID,
                     AskPx = prices.AskPx,
@@ -66,25 +130,24 @@ namespace Akuna.UI.ViewModel
                     BidQty = prices.BidQty,
                     Volume = prices.Volume
                 });
-
-                var found = _deltaIndicator.Find(item => item.instrumentId == instrumentID);
-                if (found != null)
-                {
-                    found.CurrentPrice = prices.AskPx;
-                } else
-                {
-                    _deltaIndicator.Add(new Model.DeltaIndicator(instrumentID, prices.AskPx, prices.AskPx));
-                }
-
             }
         }
+
+
 
         #region ICommand implementations
         private void StartPriceService(object parameter)
         {
-            priceService.Start();
+            _producer = Task.Factory.StartNew(() =>
+            {
+                if (_token.Token.IsCancellationRequested)
+                {
+                    StopPriceService(null);
+                }
+                priceService.Start();
+            }, _token.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
             toggleButton = false;
-
+            priceService.NewPricesArrived += PriceUpdateHandler;
         }
 
         private void StopPriceService(object parameter)
