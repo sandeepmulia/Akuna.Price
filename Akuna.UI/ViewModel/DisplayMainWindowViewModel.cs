@@ -16,6 +16,7 @@ using System.Threading;
 using System.Diagnostics;
 using System.Collections;
 using System.Collections.Concurrent;
+using System.Configuration;
 
 namespace Akuna.UI.ViewModel
 {
@@ -57,14 +58,20 @@ namespace Akuna.UI.ViewModel
             StartCommand = new DelegateCommand(StartPriceService, EnableStartButton);
             StopCommand = new DelegateCommand(StopPriceService, EnableStopButton);
             priceService = new RandomWalkPriceService();
-            StartConsumer();
-            StartTimer();
+
+            var delayedInterval = ConfigurationManager.AppSettings["DelayedUpdateInterval"];
+            var interval = Convert.ToInt32(delayedInterval);
+
+            if (interval != 0)
+            {
+                StartTimer(interval);
+            }
         }
 
-        private void StartTimer()
+        private void StartTimer(int interval)
         {
             _timer.Elapsed += _timer_Elapsed;
-            _timer.Interval = 5000;
+            _timer.Interval = interval;
             _timer.Enabled = true; //Enables timer !!
             _timer.AutoReset = true; //Re-raise event after interval elapses. This will ensure it loops
         }
@@ -79,8 +86,6 @@ namespace Akuna.UI.ViewModel
 
         private void StartConsumer()
         {
-            _token = new CancellationTokenSource();
-
             _consumer = Task.Factory.StartNew(() =>
             {
                 while (!_queue.IsCompleted)
@@ -138,6 +143,8 @@ namespace Akuna.UI.ViewModel
         #region ICommand implementations
         private void StartPriceService(object parameter)
         {
+            _token = new CancellationTokenSource();
+
             _producer = Task.Factory.StartNew(() =>
             {
                 if (_token.Token.IsCancellationRequested)
@@ -147,11 +154,14 @@ namespace Akuna.UI.ViewModel
                 priceService.Start();
             }, _token.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
             toggleButton = false;
+
+            StartConsumer();
             priceService.NewPricesArrived += PriceUpdateHandler;
         }
 
         private void StopPriceService(object parameter)
         {
+            _token.Cancel();
             priceService.Stop();
             toggleButton = true;
         }
